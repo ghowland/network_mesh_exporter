@@ -1,0 +1,82 @@
+node_id: web-001.product.prod.sjc01.local
+
+providers:
+  file:
+    enabled: true
+    path: test/inventory.json
+    interval: 10s
+  http:
+    enabled: false
+  k8s:
+    enabled: false
+
+zone:
+  keys: [metro, dc_instance]
+  separator: "/"
+  missing: exclude
+
+pairings:
+  intra_zone: false
+  max_pairings: 100
+
+slots:
+  count: 2
+  anchor_ratio: 0.5
+  allow_reuse: true
+
+health:
+  unhealthy_after: 3
+  release_hold: 30s
+  initial_grace: 30s
+
+probes:
+  cycle: 5s
+  window: 60s
+  icmp:
+    enabled: true
+    interval: 200ms
+    count: 5
+    payload_bytes: 56
+    timeout: 1s
+  udp:
+    enabled: true
+    interval: 200ms
+    count: 5
+    payload_bytes: 64
+    port: 8472
+    timeout: 1s
+  tcp:
+    enabled: true
+    interval: 500ms
+    count: 3
+    payload_bytes: 64
+    port: 9100
+    timeout: 2s
+    mode: connect
+
+responder:
+  enabled: true
+  udp_listen: "127.0.0.1:8472"
+  tcp_listen: "127.0.0.1:9100"
+
+meshping:
+  path: ./meshping
+
+reconcile:
+  interval: 10s
+
+persist:
+  path: test/lib/state.json
+  debounce: 5s
+  max_delay: 20s
+
+api:
+  listen: "127.0.0.1:9101"
+
+metrics:
+  max_series: 10000
+
+log:
+  level: debug
+  format: text
+

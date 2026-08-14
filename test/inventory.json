@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "site_table": {
+    "sjc01": { "country": "us", "metro": "sjc", "dc_label": "sjc-lab-a", "dc_instance": "01" },
+    "sjc02": { "country": "us", "metro": "sjc", "dc_label": "sjc-lab-b", "dc_instance": "02" }
+  },
+  "hosts": [
+    { "name": "web-001.product.prod.sjc01.local", "address": "127.0.0.1" },
+    { "name": "web-002.product.prod.sjc01.local", "address": "127.0.0.1" },
+    { "name": "web-001.product.prod.sjc02.local", "address": "127.0.0.1" },
+    { "name": "web-002.product.prod.sjc02.local", "address": "127.0.0.1" }
+  ]
+}
+
