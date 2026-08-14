@@ -11,8 +11,6 @@ Two binaries:
 | `meshd` | Unprivileged | Discovery, topology, TCP and UDP probes, state, metrics, HTTP API |
 | `meshping` | `CAP_NET_RAW` | ICMP echo only. JSON on stdin and stdout |
 
----
-
 ## Diagrams
 
 Three schematics cover the whole system: how a static server list becomes a
@@ -48,8 +46,6 @@ level is a configuration change, not a code change. The lower half shows what
 each slot actually measures: ICMP through the privileged helper, UDP against
 the echo responder, and TCP against a plain listener, all folded into one
 rolling window and exported under one label set.
-
----
 
 ## Why
 
