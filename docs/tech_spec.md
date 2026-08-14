@@ -1,704 +1,707 @@
-# Technical Specification — Mesh Network Test System
+# Mesh Network Test System — Technical Specification
 
-Version 0.1 — design for approval. No code is written until this document is approved.
+**Version:** 1.0 (as implemented)
+**Binaries:** `meshd`, `meshping`
+**Language:** Go 1.22
+**Module:** `github.com/example/mesh`
 
 ---
 
-## 1. Scope
+# Part 1 — What this system is
 
-This document specifies a distributed network measurement system. The system reads a host inventory from one or more providers, derives zones from host attributes by rule, forms zone pairings, assigns hosts to stable measurement slots, runs ICMP, UDP, and TCP probes across those slots, and exports the results in Prometheus exposition format.
+## 1.1 Purpose
 
-The system contains two programs:
+The system measures network quality between groups of machines and publishes the results as Prometheus metrics. It answers questions of this form:
 
-| Program | Privilege | Function |
+- What is the round trip time between data centre `sjc01` and data centre `sjc02` right now?
+- Is packet loss between metro `sjc` and metro `iad` a property of the path, or of one bad machine at one end?
+- Did the jitter between two regions change after the network change last Tuesday?
+
+It measures RTT, jitter, loss, reorder, and TCP handshake time, over ICMP, UDP, and TCP.
+
+## 1.2 The scaling problem it solves
+
+The naive approach is a full mesh: every machine probes every other machine. For `n` machines this produces `n(n-1)/2` pairs. At 50 machines that is 1,225 pairs. At 500 machines it is 124,750 pairs, times three probe types, times two directions. The measurement traffic and the metric cardinality both become unmanageable.
+
+The observation behind this system is that you rarely need machine-to-machine data. You need **location-to-location** data. Whether `sjc01` can reach `sjc02` is the operational question. Which specific machine in `sjc01` you asked is an implementation detail.
+
+So the system groups machines into **zones**, forms pairs of **zones**, and then selects a small, fixed number of machine pairs to represent each zone pair. Adding 200 machines to `sjc01` does not add a single measurement, because the zone count did not change.
+
+## 1.3 The single-bad-host problem it solves
+
+If one zone pair is measured by exactly one machine pair, and that measurement degrades, you cannot tell whether the network path degraded or whether one of the two machines has a bad network card.
+
+So each zone pair is measured by **N independent machine pairs**, called slots. If one slot degrades, the fault is at an endpoint. If all N degrade together, the fault is in the path.
+
+## 1.4 The metric continuity problem it solves
+
+A Prometheus time series is identified by its labels. If the machine pair behind a measurement changes, the labels change, the old series ends, and a new one begins. Graphs break. Alerts reset. Historical comparison is lost.
+
+So the assignment of machines to slots is **sticky**. It changes only when it must, it changes as little as possible, and it survives process restarts. A machine going away clears exactly the slot sides that held it, and nothing else.
+
+---
+
+# Part 2 — Core concepts
+
+Read this section before any other. Every part of the system is built from these five ideas.
+
+## 2.1 Host record
+
+A machine, as the system knows it. It has three important fields:
+
+| Field | Example | Purpose |
 |---|---|---|
-| `meshd` | Unprivileged | Discovery, zone derivation, slot assignment, TCP and UDP probes, state persistence, HTTP API, Prometheus endpoint |
-| `meshping` | setuid root, or `CAP_NET_RAW` | ICMP echo probes only. Reads requests as JSON on stdin. Writes results as JSON on stdout |
+| `ID` | `web-001.product.prod.sjc01.domain.com` | Unique name. Never changes for the life of the machine |
+| `Address` | `10.4.2.17` | What the probe actually dials |
+| `Attributes` | `{metro: sjc, dc_instance: 01, country: us, role: web, ...}` | An untyped bag of key-value pairs |
 
-One instance of `meshd` runs on each node. `meshd` starts `meshping` as a child process and communicates with it over pipes.
+The critical design decision is that **`Attributes` is untyped**. There is no `Country` field, no `Metro` field, no `DataCenter` field anywhere in the code. There is only a map of strings to strings.
 
----
+This is what allows the same code path to serve two very different discovery sources. The static source parses DNS names and fills in `metro`, `dc_instance`, `country`. The Kubernetes source copies every node label and fills in `k8s.region`, `k8s.zone`, `k8s.label.nodepool`. Neither knows what a zone is. The zone rule decides that later, from whatever attributes happen to exist.
 
-## 2. Terms
+## 2.2 Zone rule and zone key
 
-| Term | Definition |
+A **zone rule** is an ordered list of attribute names. Applying it to a host produces a **zone key**.
+
+```
+rule:  [metro, dc_instance]
+host:  {metro: sjc, dc_instance: 01, country: us, role: web}
+key:   "sjc/01"
+```
+
+```
+rule:  [k8s.region, k8s.zone]
+host:  {k8s.region: us-west-2, k8s.zone: us-west-2a}
+key:   "us-west-2/us-west-2a"
+```
+
+The mesh level is not a code path. It is a configuration value:
+
+| Intent | Rule |
 |---|---|
-| Host record | One inventory entry. Contains an identifier, an address, and an attribute map |
-| Provider | A component that produces a set of host records |
-| Inventory | The merged set of host records from all providers |
-| Zone rule | An ordered list of attribute keys that produces a zone key from a host record |
-| Zone key | A string that identifies one zone |
-| Zone pairing | An unordered pair of zone keys |
-| Slot | A numbered container in a zone pairing. Holds one host on side A and one host on side B |
-| Slot side | One endpoint of one slot |
-| Slot class | `anchor`, `diverse`, or `super` |
-| Delta | The list of changes produced by one reconcile |
-| Task | One directed probe of one type on one slot |
+| Data centre to data centre | `[metro, dc_instance]` |
+| Metro to metro | `[metro]` |
+| Country to country | `[country]` |
+| Cloud zone to cloud zone | `[k8s.region, k8s.zone]` |
+| Full mesh, every machine separately | `[fqdn]` |
+
+Full mesh is not a special case. It is the rule that puts exactly one machine in each zone, so a zone pair is a machine pair. All the same machinery applies.
+
+If a host lacks an attribute the rule needs, it is **unresolved**: it gets no zone and participates in nothing. This is deliberate and visible. A typo in a label shows up as an unresolved host count rather than as a silently wrong topology.
+
+## 2.3 Zone pairing
+
+An unordered pair of two distinct zone keys. Its key is the two zone keys sorted alphabetically and joined with a vertical bar:
+
+```
+sjc/01|sjc/02
+```
+
+Sorting matters: it means the pairing key is identical on every node, regardless of which side computed it. That is a precondition for the determinism described in §2.6.
+
+The set of all zone pairings is derived from the set of zone keys. Nothing about hosts enters this calculation. **Pairings are defined by rules, not by machines.**
+
+## 2.4 Slot
+
+A numbered container inside a zone pairing. It has two sides. Side A holds a host from zone A, side B holds a host from zone B.
+
+```
+Pairing "sjc/01|sjc/02"
+  Slot 0 [anchor]   A: web-001...sjc01   B: web-001...sjc02
+  Slot 1 [diverse]  A: web-002...sjc01   B: web-002...sjc02
+```
+
+The slot index is stable. The hosts inside it are replaceable. **Each side is cleared independently.** If `web-002...sjc02` disappears, slot 1 side B is cleared and refilled; slot 1 side A keeps `web-002...sjc01`, and slot 0 is untouched entirely.
+
+This independent-side rule is the single most important behaviour in the system. It is what keeps a working measurement working when something unrelated breaks.
+
+### Slot classes
+
+| Class | Rule | Question it answers |
+|---|---|---|
+| **anchor** | All anchor slots in one pairing use the **same** host on each side | The endpoints never move, so a change in the measurement is a change in the path |
+| **diverse** | Prefers a host not used elsewhere in this pairing | Spreads across machines, so one bad machine cannot represent the pairing |
+| **super** | One designated host pairs with **every** host in the far zone | Compares one machine against a whole zone at once |
+
+Anchor and diverse slots split the configured slot count by `anchor_ratio`. With `count: 4` and `anchor_ratio: 0.5`, you get 2 anchor and 2 diverse. Super slots are additional and are driven by the far zone's host count.
+
+### Fill rank
+
+When the scanner picks a host for an empty side, it records how good the choice was:
+
+| Rank | Meaning |
+|---|---|
+| 1 | The host is used nowhere else on this side of this pairing |
+| 2 | Reused, but at the lowest current use count |
+| 3 | Reused, no better candidate existed |
+
+The rank becomes a metric label. A query can then distinguish "these two measurements are truly independent" from "these two measurements share a machine, so a fault in it will appear in both."
+
+## 2.5 The reconcile
+
+One pure function that computes the entire assignment:
+
+```
+Reconcile(inventory, config, current_state, now) -> (new_state, delta)
+```
+
+It performs no I/O, holds no locks, and does not mutate its inputs. Every input arrives in one struct. The consequence is that it is fully reproducible: same inputs, same output, always.
+
+It runs in seven steps:
+
+1. **Resolve zones.** Apply the rule to every host. Build zone key set and per-zone member lists.
+2. **Build desired pairings.** All pairs of distinct zones, filtered, limit-checked.
+3. **Diff pairings.** New ones get an empty slot table. Vanished ones get a removal deadline. Existing ones keep their tables.
+4. **Validate slot sides.** Clear each side whose host is gone, ineligible, or in the wrong zone. Never touch the other side.
+5. **Update super slots.** Recompute super hosts and their target lists.
+6. **Fill empty sides.** Anchors first (widest candidate set), then diverse.
+7. **Emit delta.** The list of what changed.
+
+The **delta** is the only thing anyone downstream consumes. The runner applies the delta. A task not mentioned in the delta is never restarted.
+
+## 2.6 Determinism
+
+Every node runs its own `meshd`. They do not talk to each other. They do not elect a leader. There is no consensus protocol.
+
+They agree because the computation is deterministic:
+
+- The inventory is sorted by host ID. This is the **canonical order**.
+- The scan start offset is `fnv32(pairing_key) mod candidate_count`. Same key, same count, same offset, on every machine.
+- The scan walks the canonical order from that offset and takes the first host at the best available rank.
+- The pairing key is alphabetically sorted, so both sides compute the same key.
+
+Given the same inventory, the same config, and the same prior state, two nodes produce the same assignment independently.
+
+The start offset deserves a note. Without it, every pairing would scan from index 0, and the alphabetically first host in each zone would end up holding a slot side in every pairing that zone participates in. That host would carry all the probe load. The offset spreads the load across the candidate set while staying a pure function of the key.
 
 ---
 
-## 3. Architecture
+# Part 3 — Architecture
+
+## 3.1 Two binaries
+
+| Binary | Privilege | Job |
+|---|---|---|
+| `meshd` | Unprivileged | Everything: discovery, topology, TCP and UDP probes, state, HTTP, metrics |
+| `meshping` | `CAP_NET_RAW` | ICMP echo only. Reads JSON requests on stdin, writes JSON results on stdout |
+
+ICMP needs a raw socket. Rather than run the whole system with that capability, the ICMP work is isolated in a small program with a narrow interface. `meshping` has no configuration parsing, no network client, no state, and no aggregation. It sends packets and returns raw microsecond samples. Every statistic is computed in `meshd`.
+
+`meshd` starts one long-lived `meshping` process and multiplexes all ICMP work through it over pipes. If `meshping` cannot obtain permission, it says so in its hello message. `meshd` then disables ICMP, logs the reason once, sets `mesh_icmp_available` to 0, and continues with TCP and UDP. This is a normal, supported operating mode, not a failure.
+
+## 3.2 Data flow
 
 ```
-                 +---------------------+
-  file  ------>  |                     |
-  http  ------>  |     Providers       |
-  k8s   ------>  |                     |
-                 +----------+----------+
-                            | host records
-                            v
-                 +---------------------+
-                 |     Inventory       |  merged, snapshot on read
-                 +----------+----------+
-                            |
-                            v
-                 +---------------------+
-                 |   Zone Resolver     |  applies zone rule
-                 +----------+----------+
-                            |
-                            v
-                 +---------------------+      +---------------+
-                 |     Reconciler      |<---->|  State (RAM)  |
-                 +----------+----------+      +-------+-------+
-                            | delta                   |
-                            v                         v
-                 +---------------------+      +---------------+
-                 |      Runner         |      | JSON persist  |
-                 +----+-----------+----+      +---------------+
-                      |           |
-             tcp/udp  |           | icmp over pipe
-                      v           v
-                 +--------+  +----------+
-                 | net    |  | meshping |
-                 +--------+  +----------+
-                      |           |
-                      v           v
-                 +---------------------+
-                 |   Metric Registry   |
-                 +----------+----------+
-                            |
-                            v
-                 +---------------------+
-                 |    HTTP Server      |  /metrics /state /inventory ...
-                 +---------------------+
+  file ──┐
+  http ──┼──> Providers ──> Inventory Store ──> Snapshot
+  k8s  ──┘                                          │
+                                                    v
+                                              Zone Resolver
+                                                    │
+                                                    v
+   State (RAM) <──────────────────────────>  Reconciler
+        │                                           │
+        v                                           v delta
+  JSON file (debounced)                          Runner
+                                                    │
+                                        ┌───────────┴──────────┐
+                                        v                      v
+                                   TCP / UDP              meshping (ICMP)
+                                        │                      │
+                                        └───────────┬──────────┘
+                                                    v
+                                             Metric Registry
+                                                    │
+                                                    v
+                                              HTTP Server
+                                          /metrics /state /tasks ...
 ```
+
+## 3.3 Package layout
+
+```
+build.sh
+go.mod
+go.sum
+
+cmd/meshd/main.go              wiring, lifecycle, shutdown order
+cmd/meshd/providers.go         provider registration (lives here, see §3.4)
+cmd/meshping/main.go           the entire ICMP helper
+
+pkg/pingproto/proto.go         wire types, encoder, decoder — the only
+                               package both binaries import
+
+internal/config/config.go      every configuration struct
+internal/config/defaults.go    every default value
+internal/config/load.go        parse, normalise, validate
+internal/config/watcher.go     SIGHUP and file-change reload
+
+internal/inventory/inventory.go  HostRecord, Store, Snapshot, merge
+
+internal/zone/zone.go          Rule, transforms, Index
+
+internal/provider/provider.go  Provider interface, Manager
+internal/provider/file/file.go     local JSON document
+internal/provider/http/http.go     remote JSON document with cache
+internal/provider/k8s/k8s.go       Kubernetes node watcher
+internal/provider/k8s/types.go     list options alias
+
+internal/pairing/pairing.go    pairing key, filter, Build
+internal/slot/slot.go          classes, ranks, scanner, layout
+internal/health/health.go      state machine, hysteresis, flap detection
+internal/state/state.go        persisted structs, atomic load and save
+internal/state/store.go        in-memory authority, debounced writer
+internal/reconcile/reconcile.go  the pure function
+internal/reconcile/loop.go     trigger coalescing, scheduling
+
+internal/probe/probe.go        Kind, Target, Params, Cycle, Window, Stats
+internal/probe/header.go       in-place header write for the responder
+internal/probe/tcp/tcp.go      TCP prober
+internal/probe/udp/udp.go      UDP prober
+internal/probe/icmp/client.go  meshping supervisor and client
+
+internal/responder/responder.go  UDP and TCP echo listeners
+internal/runner/runner.go        task lifecycle
+internal/metrics/metrics.go      registry and all metric definitions
+internal/api/api.go              HTTP handlers
+```
+
+## 3.4 Why provider registration lives in `cmd/meshd`
+
+`internal/provider` defines the `Provider` interface. The three sub-packages implement it, and therefore import the parent. If the parent also imported the children to construct them, that would be an import cycle, which Go forbids.
+
+The rule: **a package that defines an interface must not import the packages that implement it.** Construction belongs in `main`, which is the only package that legitimately imports everything.
+
+This was discovered during the build. It is documented here because it constrains any future provider.
 
 ---
 
-## 4. Data model
+# Part 4 — Discovery
 
-### 4.1 Host record
+Three sources, one output type. Everything downstream is identical regardless of source.
 
-```go
-type HostRecord struct {
-    ID         string            // unique across the inventory
-    Address    string            // IP or DNS name used by probes
-    Attributes map[string]string // topology data, untyped
-    Source     string            // "file", "http", or "k8s"
-    Healthy    bool              // as reported by the provider
-    Reason     string            // why not healthy, empty when healthy
-    SeenAt     time.Time         // last time the provider reported this host
-}
-```
+Each provider produces a complete host set. A provider update **replaces** that provider's entire set atomically. There is no incremental update, so a slow or failing source can never produce a half-applied topology.
 
-The record has no country field, no metro field, and no data center field. All topology data is in `Attributes`. Zones are derived from `Attributes` by rule. This lets the Kubernetes provider work with any label set.
+The inventory is the union across providers. If two providers claim the same host ID, the higher `priority` wins and a collision counter increments.
 
-### 4.2 State
+## 4.1 File provider
 
-```go
-type State struct {
-    Version  int
-    Pairings map[string]*Pairing  // key is the zone pairing key
-}
-
-type Pairing struct {
-    ZoneA     string
-    ZoneB     string
-    Slots     []Slot
-    RemoveAt  time.Time  // zero when the pairing is active
-}
-
-type Slot struct {
-    Index     int
-    Class     string     // "anchor", "diverse", "super"
-    HostA     string     // host ID, empty when unfilled
-    HostB     string     // host ID, empty when unfilled
-    AssignedA time.Time
-    AssignedB time.Time
-    ReuseRank int        // 1, 2, or 3. See section 8.3
-}
-```
-
-`State` is the only value that persists across restarts. It contains no measurements.
-
----
-
-## 5. Providers
-
-Each provider produces a complete host set. A provider update replaces the previous set from that provider atomically. The inventory is the union of all provider sets. If two providers produce the same host ID, the provider with the higher configured priority wins, and a counter increments.
-
-### 5.1 File provider
-
-Reads a local JSON file. Re-reads on file modification and on a fixed interval.
+Reads a JSON document from local disk. Re-reads on modification and on interval. A parse failure keeps the current set in place.
 
 ```json
 {
+  "version": 1,
   "site_table": {
-    "sjc01": { "country": "us", "metro": "sjc", "dc_label": "sjc-equinix-sv5", "dc_instance": "01" },
-    "sjc02": { "country": "us", "metro": "sjc", "dc_label": "sjc-digital-sjc2", "dc_instance": "02" }
+    "sjc01": {
+      "country": "us",
+      "metro": "sjc",
+      "dc_label": "sjc-equinix-sv5",
+      "dc_instance": "01"
+    }
   },
-  "name_format": ["role_ordinal", "service", "environment", "site"],
   "hosts": [
-    { "name": "web-001.product.prod.sjc01.domain.com", "enabled": true },
-    { "name": "web-002.product.prod.sjc01.domain.com", "enabled": true },
-    { "name": "web-001.product.prod.sjc02.domain.com", "enabled": true }
+    { "name": "web-001.product.prod.sjc01.domain.com", "enabled": true }
   ]
 }
 ```
 
-Parsing of `web-001.product.prod.sjc01.domain.com` produces these attributes:
+### DNS name parsing
 
-| Key | Value |
+The name format defaults to `[role_ordinal, service, environment, site]`. Applied to `web-001.product.prod.sjc01.domain.com`:
+
+| Label | Field | Produces |
+|---|---|---|
+| `web-001` | `role_ordinal` | `role=web`, `ordinal=001` |
+| `product` | `service` | `service=product` |
+| `prod` | `environment` | `environment=prod` |
+| `sjc01` | `site` | `site=sjc01` |
+| `domain.com` | remainder | `domain=domain.com` |
+
+Plus `fqdn` and `hostname`.
+
+### Site table enrichment
+
+The DNS name cannot carry the country or the data centre label — those are internal facts. The `site_table` supplies them. The `site` value is looked up, and the entry's fields are merged into the attributes.
+
+If the site is absent from the table, a fallback splits the token on the alphabetic-to-numeric boundary: `sjc01` becomes `metro=sjc`, `dc_instance=01`. Country and DC label stay unset. A zone rule that needs them will mark the host unresolved, which is the correct and visible outcome.
+
+Per-host `attributes` in the document override everything derived, so one machine can be corrected without a schema change.
+
+## 4.2 HTTP provider
+
+Fetches the same document schema from a URL. This is the source of truth when nodes should not carry a local copy.
+
+### Fetch behaviour
+
+| Response | Action |
 |---|---|
-| `role` | `web` |
-| `ordinal` | `001` |
-| `service` | `product` |
-| `environment` | `prod` |
-| `site` | `sjc01` |
-| `domain` | `domain.com` |
-| `fqdn` | full name |
+| 200 | Parse, validate, replace the set, rewrite the cache |
+| 304 | Keep the current set, do not touch the cache |
+| Non-2xx or network error | Keep the current set, back off exponentially |
+| Parse or validation failure | Keep the current set, never apply the bad document |
 
-The `site` value is then looked up in `site_table`. The table entry adds `country`, `metro`, `dc_label`, and `dc_instance`. If the site is not in the table, the provider splits the site token into a leading alphabetic part and a trailing numeric part, and sets `metro` and `dc_instance` from the split. `country` and `dc_label` stay unset.
+Conditional requests use `If-None-Match` and `If-Modified-Since` from the previous response.
 
-The host ID is the FQDN. The address is the FQDN.
+### The cache
 
-### 5.2 HTTP provider
+The cache is what makes this source safe.
 
-Fetches the same JSON document from a URL. This is the source of truth when the file is not present on the node.
+- On start, the cache is read and applied **before** the first fetch. The node is operational before the network is.
+- Writes are atomic: temp file in the same directory, `fsync`, `rename`. A crash mid-write cannot corrupt it.
+- A sidecar `.meta.json` holds the ETag, `Last-Modified`, and fetch time.
+- `cache_max_age` (default 24h) marks the set stale when exceeded. **Stale hosts stay in the inventory.** Staleness is reported through a gauge; it does not clear slots. Losing contact with the config server must not tear down the measurement mesh.
 
-Fetch behaviour:
+The auth header file is re-read on every fetch, so a rotated token is picked up without a restart.
 
-| Item | Behaviour |
-|---|---|
-| Interval | `http.interval`, default 60 s |
-| Method | GET |
-| Conditional request | Sends `If-None-Match` and `If-Modified-Since` from the previous response |
-| 200 response | Parse, validate, replace the provider set, write the body to the cache file |
-| 304 response | Keep the current set. No cache write |
-| Non-2xx, or network failure | Keep the current set. Increment an error counter. Retry with exponential backoff, base 5 s, cap 300 s, with jitter |
-| Parse failure or validation failure | Keep the current set. Increment a counter. The bad document is never applied |
-| Timeout | `http.timeout`, default 10 s |
+## 4.3 Kubernetes provider
 
-Cache behaviour:
+Lists and watches `Node` objects. In-cluster credentials, or a kubeconfig path.
 
-- The cache file path is `http.cache_path`, default `/var/lib/meshd/inventory.json`.
-- The write is atomic: write to a temporary file in the same directory, `fsync`, then `rename`.
-- A sidecar file `inventory.meta.json` holds the ETag, the `Last-Modified` value, and the fetch timestamp.
-- On start, the cache is read first and applied immediately. The first HTTP fetch then runs. This makes the node operational before the network is available.
-- `http.cache_max_age`, default 24 h. If the cache is older than this value and no fetch has succeeded, the provider reports its hosts as stale. Stale hosts stay in the inventory and a gauge reports the cache age. Existing slots are not cleared because of staleness.
+Events are debounced (default 2s), so a rolling node update does not emit one host set per node.
 
-Authentication: optional `Authorization` header from a config value or from a file path. TLS uses the system trust store, with an optional `ca_file`.
-
-### 5.3 Kubernetes provider
-
-Lists and watches `Node` objects. Uses in-cluster credentials when available, otherwise a kubeconfig path.
-
-| Item | Behaviour |
-|---|---|
-| Mode | Watch with a resync interval, `k8s.resync`, default 300 s |
-| Fallback | If watch is not available, list on `k8s.interval`, default 60 s |
-| Selector | `k8s.label_selector`, default empty, which selects all nodes |
-| Host ID | `k8s://<cluster_name>/<node_name>` |
-| Address | First match from `k8s.address_order`, default `["InternalIP", "Hostname"]` |
-
-Attribute mapping:
+### Attribute mapping
 
 | Attribute key | Source |
 |---|---|
-| `k8s.cluster` | `k8s.cluster_name` from config |
+| `k8s.cluster` | config value |
 | `k8s.node` | node name |
-| `k8s.region` | label `topology.kubernetes.io/region` |
-| `k8s.zone` | label `topology.kubernetes.io/zone` |
-| `k8s.instance-type` | label `node.kubernetes.io/instance-type` |
-| `k8s.arch` | label `kubernetes.io/arch` |
-| `k8s.os` | label `kubernetes.io/os` |
-| `k8s.hostname` | label `kubernetes.io/hostname` |
-| `k8s.label.<name>` | every node label, with `/` replaced by `_` |
-| `k8s.annotation.<name>` | node annotations that match `k8s.annotation_allow` |
+| `k8s.region` | `topology.kubernetes.io/region` |
+| `k8s.zone` | `topology.kubernetes.io/zone` |
+| `k8s.instance-type` | `node.kubernetes.io/instance-type` |
+| `k8s.arch`, `k8s.os`, `k8s.hostname` | corresponding standard labels |
+| `k8s.label.<name>` | **every** node label |
+| `k8s.annotation.<name>` | annotations on the allow list (default: none) |
+| `k8s.provider-id`, `k8s.kubelet` | node spec and status |
 
-The default `k8s.annotation_allow` is empty. Annotations are large and change often. They are opt-in.
+Every label is copied with a prefix, and well-known ones are additionally copied to short keys. The zone rule can then use either. The provider imposes no schema, which is exactly the point: a cluster with a custom `datacenter` label works with `zone.keys: [k8s.label.datacenter]` and no code change.
+
+Host ID is `k8s://<cluster>/<node>`, which keeps it distinct from a DNS-named host in the same inventory.
+
+Address comes from `status.addresses` by preference order, default `[InternalIP, Hostname]`.
+
+### Health signals
+
+| Signal | Effect |
+|---|---|
+| `Ready` condition not `True` | Ineligible |
+| `spec.unschedulable` | Ineligible |
+| Taint on the deny list | Ineligible |
+| `deletionTimestamp` set | Ineligible immediately |
+| Absent from resync | Ineligible after `missing_grace` |
+
+These are **provider-authoritative**: they bypass hysteresis and take effect at once. The cluster knows more about its own nodes than a probe does.
 
 ---
 
-## 6. Zone derivation
+# Part 5 — Health and hysteresis
 
-### 6.1 Rule
+This subsystem exists to stop a brief failure from rewriting the assignment.
 
-```json
-{
-  "zone": {
-    "keys": ["metro", "dc_instance"],
-    "separator": "/",
-    "missing": "exclude"
-  }
-}
-```
+## 5.1 States
 
-The resolver reads each key from the host attributes in order and joins the values with the separator.
-
-| `missing` value | Behaviour when a key has no value |
-|---|---|
-| `exclude` | The host is not placed in a zone. Default |
-| `empty` | The value is treated as an empty string |
-| `literal:<v>` | The value is replaced by `<v>` |
-
-### 6.2 Mesh modes as rules
-
-| Mode | `keys` value |
-|---|---|
-| Full mesh | `["fqdn"]` or `["k8s.node"]` |
-| DC to DC | `["metro", "dc_instance"]` |
-| Metro to metro | `["metro"]` |
-| Country to country | `["country"]` |
-| Kubernetes zone to zone | `["k8s.region", "k8s.zone"]` |
-| Kubernetes region to region | `["k8s.region"]` |
-
-Full mesh is not a separate code path. It is the rule that puts one host in each zone.
-
-### 6.3 Optional transforms
-
-Each key can carry a transform, applied before the join.
-
-```json
-{ "keys": [{ "key": "k8s.zone", "transform": "lower" }] }
-```
-
-Supported transforms: `lower`, `upper`, `trim`, `prefix:<n>` which keeps the first n characters, `regex:<pattern>:<replacement>`.
-
-### 6.4 Pairing set
-
-```json
-{
-  "pairings": {
-    "intra_zone": false,
-    "include": [],
-    "exclude": [],
-    "max_pairings": 5000
-  }
-}
-```
-
-- The base set is all unordered pairs of distinct zone keys.
-- `intra_zone: true` adds one pairing per zone where both sides are the same zone. Slot fill then requires two distinct hosts.
-- `include` and `exclude` hold glob patterns matched against the pairing key. `include` runs first when non-empty.
-- The pairing key is the two zone keys sorted alphabetically and joined with `|`.
-- If the pairing count exceeds `max_pairings`, the reconcile aborts, keeps the previous state, and sets an alert gauge. This prevents a wrong zone rule from creating a very large pairing set.
-
----
-
-## 7. Slots
-
-### 7.1 Configuration
-
-```json
-{
-  "slots": {
-    "count": 4,
-    "anchor_ratio": 0.5,
-    "anchor_rounding": "up",
-    "super_hosts": 0,
-    "allow_reuse": true,
-    "rebalance_on_add": false
-  }
-}
-```
-
-`count` is the value of N per zone pairing. It is a minimum and also the target.
-
-### 7.2 Classes
-
-| Class | Fill rule | Purpose |
+| State | Eligible for a slot? | Meaning |
 |---|---|---|
-| `anchor` | All anchor slots in one pairing use the same host on side A and the same host on side B | The endpoints do not change. A change in the result is a change in the path |
-| `diverse` | Prefers a host not yet used in this pairing on that side | Spreads across hosts. One bad host cannot represent the pairing |
-| `super` | One designated host on side A pairs with each eligible host on side B, one slot per target host | Compares one machine against every machine in the other zone |
+| `unknown` | **Yes** | Seen but not yet probed |
+| `healthy` | **Yes** | Probes succeeding |
+| `suspect` | **Yes** | Failing, below `unhealthy_after` |
+| `pending` | **Yes** | Marked unhealthy, inside `release_hold` |
+| `unhealthy` | No | Hold expired, slot sides may be cleared |
+| `cooldown` | No | Flapped too often, held out |
+| `ineligible` | No | Provider said so |
 
-Anchor slot count is `round(count * anchor_ratio)` using `anchor_rounding`. The remainder are diverse. With `count: 4` and `anchor_ratio: 0.5` the result is 2 anchor slots and 2 diverse slots.
+Note that four states are eligible. **A host is not released the moment it fails.** It passes through `suspect` (probe failures accumulating), then `pending` (marked, but held), and only reaches `unhealthy` after `release_hold` expires. Only then does the reconcile clear its slot sides.
 
-Super slots are additional. They are not taken from `count`. A pairing with `super_hosts: 1` and a side B of 20 hosts adds 20 super slots. Super slot count is capped by `super_max_targets`, default 50.
+`unknown` is eligible because a freshly discovered host has never been probed. If it were ineligible, no slot could ever be filled on a fresh start.
 
-### 7.3 Super host selection
+## 5.2 Timers
 
-`super_hosts` is a count per zone. Selection is by rule, in this order:
-
-1. Hosts matching `slots.super_selector`, a set of attribute key and value pairs. If the selector is set and matches enough hosts, use those hosts in canonical order.
-2. Otherwise, the first `super_hosts` healthy hosts in the zone, in canonical order.
-
-A super host is sticky. It changes only when it becomes ineligible.
-
----
-
-## 8. Reconcile
-
-### 8.1 Signature
-
-```go
-func Reconcile(snap Inventory, cfg Config, cur *State, now time.Time) (*State, Delta)
-```
-
-The function is pure. It performs no input and no output. It is fully testable from fixtures.
-
-### 8.2 Steps
-
-1. **Snapshot.** Copy the inventory under a read lock.
-2. **Resolve zones.** Apply the zone rule to every host. Build the zone key set and the sorted host list per zone. Count unresolved hosts.
-3. **Desired pairings.** Build all pairings, apply filters, check `max_pairings`.
-4. **Diff pairings.**
-   - Present in both: keep the slot table.
-   - New: create an empty slot table with the correct class layout.
-   - Absent: set `RemoveAt = now + pairing_removal_hold`. Delete when `now >= RemoveAt`. Clear `RemoveAt` if the pairing returns.
-5. **Validate slot sides.** A side is cleared when any of these is true:
-   - The host is not in the snapshot.
-   - The host is unhealthy past the hysteresis threshold.
-   - The host no longer resolves to the required zone.
-   - The host no longer satisfies its slot class predicate.
-   - The slot class layout changed because `count` or `anchor_ratio` changed.
-   
-   **Clearing one side never clears the other side.** This is the mechanism that keeps valid measurements running when one host fails.
-6. **Fill.** For each empty side, in order anchor, then super, then diverse, run the scan in section 8.3.
-7. **Emit delta.** List the slot sides that changed, the pairings created, and the pairings deleted.
-
-### 8.3 Scan
-
-Candidates are the healthy hosts of the required zone, sorted by host ID. The scan starts at `fnv32(pairing_key) % len(candidates)` and wraps. The start offset spreads slot load across the candidate set instead of loading the alphabetically first hosts with every pairing. The offset is a pure function of the pairing key and is therefore identical on every node.
-
-Rank order for a diverse slot side:
-
-| Rank | Condition |
-|---|---|
-| 1 | The host is not used on this side in this pairing |
-| 2 | The host is used on this side at the minimum current use count |
-| 3 | Any eligible host |
-
-The scan takes the first candidate at the best available rank. When the zone has enough hosts, rank 1 always wins and no host is reused. When hosts are scarce, the slot still fills at a lower rank. The chosen rank is stored in `Slot.ReuseRank` and is exported as a metric label, so a query can distinguish a slot with independent endpoints from a slot that reuses a host.
-
-If `allow_reuse` is false, only rank 1 is accepted. An unfillable slot stays empty and increments `mesh_slots_unfilled`.
-
-For an anchor slot, the first anchor slot in the pairing selects the host by scan. All other anchor slots copy that host. If the anchor host becomes ineligible, all anchor slot sides in that pairing are cleared together and re-selected together.
-
-### 8.4 Determinism
-
-Two nodes with the same inventory, the same config, and the same prior state produce the same new state without communicating. The prior state is the only shared value. Nodes do not exchange state; each node loads its own state file. Divergence between nodes is possible after a restart with a lost state file, and is visible in the metrics because the slot host labels differ.
-
-### 8.5 Triggers
-
-Reconcile runs on: a provider update, a config reload, a health state transition, a pairing removal hold expiry, a periodic tick (`reconcile.interval`, default 30 s), and a POST to `/reconcile`.
-
-Triggers are coalesced. One reconcile runs at a time. Triggers that arrive during a run cause exactly one further run afterwards, not one per trigger.
-
----
-
-## 9. Health and hysteresis
-
-### 9.1 Health inputs
-
-Provider health is authoritative and immediate. Probe health is subject to hysteresis.
-
-**File and HTTP providers:**
-
-| Signal | Default |
-|---|---|
-| `enabled: false` in the document | Never eligible |
-| Address does not resolve | Ineligible after `dns_grace`, default 120 s |
-| Consecutive failed probe cycles | 3 marks unhealthy |
-| Loss ratio over the window | 100 percent over 60 s marks unhealthy |
-| Never probed successfully after assignment | Unhealthy after `initial_grace`, default 90 s |
-
-**Kubernetes provider:**
-
-| Signal | Default |
-|---|---|
-| `Ready` condition | Must be `True` |
-| `spec.unschedulable` | `true` marks ineligible |
-| Taints | Ineligible if any taint key is in `k8s.taint_deny`. Default: `node.kubernetes.io/unreachable`, `node.kubernetes.io/not-ready`, `node.kubernetes.io/unschedulable` |
-| `metadata.deletionTimestamp` set | Ineligible immediately |
-| Node absent from last resync | Ineligible after `missing_grace`, default 60 s |
-| Label selector | Must match to be eligible |
-
-### 9.2 Hysteresis
-
-| Option | Default | Effect |
+| Setting | Default | Effect |
 |---|---|---|
-| `unhealthy_after` | 3 failed cycles | Cycles of failure before the unhealthy mark |
-| `release_hold` | 60 s | Delay between the unhealthy mark and the slot side clear |
-| `healthy_after` | 2 successful cycles | Cycles of success before the host is eligible again |
-| `initial_grace` | 90 s | New hosts are not marked unhealthy in this window |
-| `missing_grace` | 60 s | Grace for a host absent from a provider update |
-| `dns_grace` | 120 s | Grace for a name that does not resolve |
-| `flap_threshold` | 3 transitions in 10 min | Above this, the host enters cooldown |
-| `flap_cooldown` | 15 min | Duration of the ineligible period after flapping |
-| `pairing_removal_hold` | 300 s | Delay before a vanished pairing is deleted |
-| `reclaim` | false | If true, a recovered host returns to a slot side it previously held when that side is currently filled at rank 2 or rank 3 |
+| `unhealthy_after` | 3 cycles | Failures before the mark |
+| `release_hold` | 60s | Delay between mark and slot clear |
+| `healthy_after` | 2 cycles | Successes before eligible again |
+| `initial_grace` | 90s | New host cannot be marked unhealthy |
+| `missing_grace` | 60s | Grace for absence from a provider |
+| `dns_grace` | 120s | Grace for unresolvable address |
+| `flap_threshold` | 3 in 10min | Eligibility transitions before cooldown |
+| `flap_cooldown` | 15min | Held ineligible after flapping |
+| `pairing_removal_hold` | 300s | Delay before a vanished pairing is deleted |
 
-`release_hold` is the important value. Without it, a short network event rewrites slot assignments and breaks the time series in the exact window where the measurement matters.
+**`release_hold` is the important one.** Without it, a ten-second network event rewrites slot assignments and breaks the time series in the exact window where the measurement matters most.
 
----
+**Flap detection** counts eligibility transitions in a rolling window. A host that crosses the threshold is forced into cooldown, so an unstable machine cannot cause repeated reassignment churn.
 
-## 10. Probes
-
-### 10.1 Common parameters
-
-```json
-{
-  "probes": {
-    "icmp": { "enabled": true,  "interval": "1s", "count": 10, "payload_bytes": 56,  "timeout": "1s" },
-    "udp":  { "enabled": true,  "interval": "1s", "count": 10, "payload_bytes": 64,  "port": 8472, "timeout": "1s" },
-    "tcp":  { "enabled": true,  "interval": "5s", "count": 5,  "payload_bytes": 64,  "port": 9100, "timeout": "2s", "mode": "connect" }
-  },
-  "cycle": "15s",
-  "window": "60s"
-}
-```
-
-- `interval` is the delay between packets inside one cycle.
-- `count` is the number of packets per cycle.
-- `cycle` is the delay between cycles for one task.
-- `window` is the aggregation window for jitter, loss, and percentiles.
-- `payload_bytes` is the payload size, not the total frame size. The ICMP total IP packet size is `payload_bytes + 8 + 20` for IPv4.
-
-`tcp.mode` values:
-
-| Value | Behaviour |
-|---|---|
-| `connect` | Measure the time to complete the three-way handshake. Close immediately. No payload is sent. `payload_bytes` is ignored |
-| `echo` | Connect, send `payload_bytes` bytes, read the same number of bytes back, measure the round trip. Requires a responder on the target port |
-
-`udp.mode` is always echo. UDP requires a responder. `meshd` runs a UDP responder on `udp.port` and a TCP responder on `tcp.port` when `responder.enabled` is true, default true. The responder returns the received payload unchanged, with the first 16 bytes replaced by a sequence number and a receive timestamp.
-
-Probe packets carry a magic value in the first 4 bytes so that a responder can reject unrelated traffic.
-
-### 10.2 Measured values
-
-Per directed task, per window:
-
-| Value | Definition |
-|---|---|
-| RTT min, max, mean | Over successful samples in the window |
-| RTT percentiles | p50, p90, p99, configurable |
-| Jitter | Mean of the absolute difference between consecutive RTT samples |
-| Loss ratio | Lost samples divided by sent samples |
-| Sent, received, lost | Counters |
-| Reorder count | Samples that arrive out of sequence |
-| TCP connect time | Separate from TCP round trip time when `mode: echo` |
-| Error count by class | timeout, refused, unreachable, resolve, permission |
-
-### 10.3 Direction
-
-Each slot produces two directed tasks: A to B and B to A. Each node runs only the tasks where it is the source. The forward path and the reverse path are not always the same, so both are measured independently. No coordination between the two nodes is required.
+The reconcile loop asks the tracker for its earliest pending deadline and sleeps until exactly then. It does not poll for expiry.
 
 ---
 
-## 11. `meshping` helper
+# Part 6 — Persistence
 
-### 11.1 Reason for a separate program
+The authoritative state lives in RAM as Go structs. The JSON file is a durable copy.
 
-ICMP requires a raw socket or `CAP_NET_RAW`. Isolating this in a small program with a narrow input and output surface keeps `meshd` unprivileged. `meshping` contains no configuration parsing, no discovery, no HTTP, and no state.
+| Aspect | Behaviour |
+|---|---|
+| Load | On start, before the first reconcile |
+| Dirty | Set by any reconcile with a non-empty delta |
+| Debounce | Timer resets on each change; default 60s |
+| Cap | `max_delay` (default 300s) bounds total postponement so continuous churn cannot prevent a write |
+| Write | Temp file in same directory, `fsync`, `rename` |
+| Missing file | Not an error. Empty state, assign from scratch |
+| Corrupt or version mismatch | Empty state, log a topology reset, increment `mesh_state_reset_total` |
+| Shutdown | Immediate write if dirty |
 
-### 11.2 Privilege
+Write rate is bounded by `60 / debounce_seconds` per minute, because each write requires a full quiet window. A 60s debounce caps at one write per minute; 3s caps at 20.
 
-Preferred: `setcap cap_net_raw+ep /usr/local/bin/meshping`. Alternative: setuid root. `meshping` drops all other privileges at start and never executes another program. On Linux, `meshping` may instead use a non-privileged ICMP datagram socket when `net.ipv4.ping_group_range` permits it; it tries this first and falls back to a raw socket.
+The file holds pairing keys, slot indices, classes, assigned host IDs, ranks, timestamps, and super host lists. **It holds no measurements.**
 
-### 11.3 Protocol
+## 6.1 Fingerprints
 
-Line-delimited JSON over stdin and stdout. One JSON object per line. `meshd` starts one long-lived `meshping` process and multiplexes all ICMP work through it.
+The state carries two fingerprints:
 
-**Request:**
+- **Zone rule fingerprint** — a hash of the rule specification.
+- **Slot config fingerprint** — a string encoding count, ratio, rounding, super settings, reuse.
 
-```json
-{"type":"ping","id":"a1b2c3","target":"10.0.4.12","count":10,"interval_ms":1000,"payload_bytes":56,"timeout_ms":1000,"ttl":64,"df":false}
+If either differs from the current configuration at load time, the entire slot table is discarded and rebuilt. The reason: a changed rule redefines what a slot *means*. Keeping the old table would produce assignments the new rule would never make.
+
+## 6.2 Why `/state` reads RAM
+
+The API reads the in-memory structs under a read lock, not the file. A request during the debounce window therefore returns current data, not data up to 60 seconds old.
+
+---
+
+# Part 7 — Measurement
+
+## 7.1 Task model
+
+A **task** is one directed probe of one type on one slot:
+
+```
+TaskKey{Pairing, Slot, Kind, Forward}
 ```
 
-**Result:**
+Each slot produces two directed tasks per enabled probe type: A→B and B→A. **Each node runs only the tasks where it is the source.** The forward and reverse paths are not always the same, and one direction can be lossy while the other is clean, so both are measured independently with no coordination between the two nodes.
+
+Each task owns one goroutine and one ticker. Its first tick is offset by `fnv32(taskkey) mod cycle`, so all tasks do not fire simultaneously and produce a synchronised burst.
+
+## 7.2 Delta application
+
+When the reconcile produces a delta, the runner:
+
+- **Starts** tasks that are new
+- **Stops** tasks that are gone
+- **Leaves alone** tasks whose endpoints and parameters are unchanged
+- **Restarts with a fresh window** tasks whose endpoints changed
+
+The identity check is `src_host > dst_host @ dst_addr` plus the parameter struct. If any of that changed, the task measures a different thing, so mixing old and new samples in one window would be wrong.
+
+When a task stops, its metric series are deleted from the registry. A replaced host leaves nothing stale behind.
+
+## 7.3 Payload format
+
+UDP and TCP echo probes share a 16-byte header:
+
+| Bytes | Content |
+|---|---|
+| 0–3 | Magic `6d 65 73 68` ("mesh") |
+| 4–7 | Sequence number |
+| 8–15 | Send timestamp, nanoseconds |
+| 16+ | Padding to `payload_bytes` |
+
+The magic value lets the responder reject unrelated traffic. The responder echoes the packet at its original size, overwriting only the timestamp with its receive time, so the reply path carries the same packet size as the request path.
+
+## 7.4 Probers
+
+### TCP
+
+Two modes.
+
+**`connect`** (default): dial, measure the handshake, close immediately. No payload. Needs only a listener on the far side, not a responder. This is the safest default — it works against any TCP service.
+
+**`echo`**: dial, send the payload, read it back, and report handshake time and payload round trip **separately**. Requires the mesh responder on the far side.
+
+Each iteration opens its own connection. A reused connection would measure only the payload path and would hide a handshake failure.
+
+### UDP
+
+One socket per cycle. Sends `count` packets at `interval`, then reads until the timeout. Replies are matched by sequence number.
+
+- Unmatched sequence → **loss**
+- Reply arriving after a higher sequence already seen → **reorder**
+
+Samples are reordered into send order before being handed to the window, because the jitter calculation reads consecutive samples in send order.
+
+### ICMP
+
+`meshd` sends a JSON request to `meshping` and waits for the matching result:
 
 ```json
-{"type":"result","id":"a1b2c3","target":"10.0.4.12","resolved":"10.0.4.12",
+{"type":"ping","id":"42","target":"10.0.4.12","count":10,
+ "interval_ms":1000,"payload_bytes":56,"timeout_ms":1000,"ttl":64}
+```
+
+```json
+{"type":"result","id":"42","target":"10.0.4.12","resolved":"10.0.4.12",
  "sent":10,"received":9,"lost":1,"reordered":0,
  "rtt_us":[1204,1190,1250,1198,1310,1201,1188,1240,1199],
  "error":"","error_class":""}
 ```
 
-`meshd` computes all statistics from `rtt_us`. `meshping` performs no aggregation. This keeps the privileged program as small as possible.
+A request with no result within `count × (interval + timeout) + 5s` is abandoned and a cancel is sent, so a lost result never leaks a goroutine or a map entry.
 
-**Other messages:**
+#### meshping internals
 
-| Type | Direction | Purpose |
-|---|---|---|
-| `hello` | out | Sent once at start. Contains the version and the privilege mode obtained |
-| `cancel` | in | Cancel a request by ID |
-| `error` | out | A request could not be started. Contains the ID and the reason |
-| `shutdown` | in | Finish current work and exit |
+Sockets are opened in this order:
 
-Errors and diagnostics go to stderr as plain text. Stdout carries only protocol JSON.
+1. Unprivileged ICMP datagram socket (`udp4`/`udp6`). Works when `net.ipv4.ping_group_range` includes the running group. **No capability needed.**
+2. Raw socket (`ip4:icmp`). Needs `CAP_NET_RAW`.
+3. Neither → report `priv: none` in hello and exit.
 
-### 11.4 Supervision
+Replies are matched by **sequence number, not by ICMP identifier**. On an unprivileged datagram socket the kernel rewrites the identifier, so identifier matching would drop every reply in that mode. The payload magic value provides the second check.
 
-- `meshd` starts `meshping` at start and restarts it on exit, with backoff of 1 s, doubling to 30 s.
-- If `meshping` does not produce `hello` within 5 s, `meshd` terminates it and retries.
-- If `meshping` cannot obtain ICMP privilege, it reports the failure in `hello`. `meshd` then disables ICMP probes, logs the reason once, and sets `mesh_icmp_available` to 0. TCP and UDP probes continue.
-- A request with no result within `timeout_ms * count + 5s` is marked failed and the ID is abandoned.
+The do-not-fragment bit is accepted in the protocol and ignored, because setting it is not portable through `golang.org/x/net/icmp`. TTL is applied.
+
+## 7.5 Rolling window
+
+Each task owns a `Window` of duration `probes.window` (default 60s). It holds:
+
+- Individual RTT samples with timestamps, in send order
+- Per-cycle counters: sent, received, lost, reordered, error class
+
+Expired entries are dropped on each add and on each read.
+
+Computed statistics:
+
+| Value | Definition |
+|---|---|
+| Min, Max, Mean | Over successful samples |
+| Percentiles | Nearest-rank over the sorted samples; default p50, p90, p99 |
+| **Jitter** | Mean absolute difference between **consecutive** samples in send order |
+| Loss ratio | Lost ÷ sent |
+| Connect mean | TCP handshake time, separate from round trip |
+| Last success | Timestamp of the most recent received sample |
+
+Jitter requires send order, which is why the UDP prober reorders its results before handing them over.
+
+## 7.6 Responder
+
+UDP and TCP echo listeners, enabled by default. Without them, a node can measure outward but cannot be measured, and the reverse direction of every slot it participates in would be blank.
+
+- **UDP:** read, verify magic, stamp receive time, write back at the original size.
+- **TCP:** accept, echo each payload, 30-second read deadline. The deadline bounds an idle connection, so a `connect`-mode prober that never sends a payload does not hold a goroutine.
+
+Rejected packets — those failing the magic check — are counted separately, which distinguishes "nothing is arriving" from "the wrong thing is arriving."
 
 ---
 
-## 12. Persistence
+# Part 8 — Metrics
 
-The authoritative state is in RAM. The JSON file is a durable copy.
+## 8.1 Probe labels
 
-| Item | Behaviour |
+Every probe metric carries:
+
+| Label | Example |
 |---|---|
-| Load | On start, before the first reconcile |
-| Dirty flag | Set by any reconcile that produces a non-empty delta |
-| Debounce | `persist.debounce`, default 60 s. Resets on each further change |
-| Maximum delay | `persist.max_delay`, default 300 s. Caps the debounce so continuous churn cannot postpone a write forever |
-| Write | Temporary file in the same directory, `fsync`, `rename` |
-| Path | `persist.path`, default `/var/lib/meshd/state.json` |
-| Shutdown | Write immediately if dirty |
-| Missing or corrupt file | Start with empty state, assign from scratch, log a topology reset, increment `mesh_state_reset_total` |
-| Version mismatch | Same as corrupt |
+| `zone_src` | `sjc/01` |
+| `zone_dst` | `sjc/02` |
+| `host_src` | `web-001.product.prod.sjc01.domain.com` |
+| `host_dst` | `web-001.product.prod.sjc02.domain.com` |
+| `slot` | `0` |
+| `class` | `anchor` |
+| `reuse_rank` | `1` |
+| `probe` | `icmp` |
 
-A debounce of 60 s caps writes at one per minute. A debounce of 3 s caps writes at 20 per minute. Each write requires a full quiet window, so the write rate is at most `60 / debounce_seconds` per minute.
+The `slot` label is what makes N useful:
 
----
+```promql
+# Is the path bad?
+avg by (zone_src, zone_dst) (mesh_rtt_mean_seconds{probe="icmp"})
 
-## 13. Metrics
+# Is one host bad?
+mesh_rtt_mean_seconds{zone_src="sjc/01", zone_dst="sjc/02", probe="icmp"}
+```
 
-Namespace `mesh`. Common labels on all probe metrics:
+The first aggregates across slots and gives the zone pair answer. The second keeps the slot label and shows whether one slot differs from the others.
 
-| Label | Value |
-|---|---|
-| `zone_src` | Source zone key |
-| `zone_dst` | Destination zone key |
-| `host_src` | Source host ID |
-| `host_dst` | Destination host ID |
-| `slot` | Slot index |
-| `class` | `anchor`, `diverse`, `super` |
-| `reuse_rank` | 1, 2, or 3 |
-| `probe` | `icmp`, `udp`, `tcp` |
-
-Probe metrics:
+## 8.2 Probe metrics
 
 | Metric | Type |
 |---|---|
 | `mesh_rtt_seconds` | Histogram |
-| `mesh_rtt_min_seconds`, `mesh_rtt_max_seconds`, `mesh_rtt_mean_seconds` | Gauge |
+| `mesh_rtt_min_seconds`, `_max_`, `_mean_` | Gauge |
+| `mesh_rtt_quantile_seconds` | Gauge, extra `quantile` label |
 | `mesh_jitter_seconds` | Gauge |
 | `mesh_loss_ratio` | Gauge |
-| `mesh_packets_sent_total`, `mesh_packets_received_total`, `mesh_packets_lost_total` | Counter |
+| `mesh_packets_sent_total`, `_received_`, `_lost_` | Counter |
 | `mesh_reorder_total` | Counter |
 | `mesh_tcp_connect_seconds` | Histogram |
-| `mesh_probe_errors_total` | Counter, extra label `class` |
+| `mesh_probe_errors_total` | Counter, extra `err_class` label |
 | `mesh_probe_last_success_timestamp_seconds` | Gauge |
 
-System metrics:
+The error-class label is named `err_class`, not `class`, because `class` is already taken by the slot class. Prometheus rejects duplicate label names on one metric.
 
-| Metric | Type |
+## 8.3 System metrics
+
+| Metric | Meaning |
 |---|---|
-| `mesh_hosts_total` | Gauge, label `source`, `state` |
-| `mesh_hosts_unresolved` | Gauge |
-| `mesh_zones_total` | Gauge |
-| `mesh_pairings_total` | Gauge |
-| `mesh_slots_total` | Gauge, label `class` |
-| `mesh_slots_unfilled` | Gauge |
-| `mesh_slot_changes_total` | Counter, label `reason` |
-| `mesh_reconcile_duration_seconds` | Histogram |
-| `mesh_reconcile_total` | Counter, label `trigger` |
-| `mesh_provider_fetch_total` | Counter, label `source`, `result` |
-| `mesh_provider_cache_age_seconds` | Gauge, label `source` |
-| `mesh_provider_last_success_timestamp_seconds` | Gauge, label `source` |
-| `mesh_state_persist_total` | Counter |
-| `mesh_state_reset_total` | Counter |
-| `mesh_icmp_available` | Gauge |
-| `mesh_meshping_restarts_total` | Counter |
+| `mesh_hosts_total{source,state}` | Inventory by source and health state |
+| `mesh_hosts_unresolved` | Hosts with no zone under the current rule |
+| `mesh_zones_total`, `mesh_pairings_total` | Topology size |
+| `mesh_slots_total{class}`, `mesh_slots_unfilled` | Slot table state |
+| `mesh_slot_changes_total{reason}` | Assignment churn, by cause |
+| `mesh_reconcile_duration_seconds`, `_total{trigger}`, `_errors_total` | Reconcile behaviour |
+| `mesh_provider_fetch_total{source,result}` | Discovery success and failure |
+| `mesh_provider_cache_age_seconds{source}` | HTTP cache freshness |
+| `mesh_state_persist_total`, `_failures_total`, `mesh_state_dirty` | Persistence |
+| `mesh_state_reset_total` | Times the assignment restarted from scratch |
+| `mesh_icmp_available` | 1 when meshping has permission |
+| `mesh_meshping_restarts_total` | Helper stability |
+| `mesh_tasks_running` | Tasks on this node |
+| `mesh_series_count`, `mesh_series_dropped_total` | Cardinality guard |
+| `mesh_responder_total{kind}` | Responder activity |
 
-Series count is `pairings * (slots + super_slots) * probe_types * 2`. The exporter refuses to register beyond `metrics.max_series`, default 200000, and increments a counter instead.
+## 8.4 Cardinality
+
+Series count is approximately:
+
+```
+pairings × (slots + super_slots) × probe_types × 2 directions
+```
+
+`metrics.max_series` (default 200,000) caps registration. Beyond it, samples are dropped and `mesh_series_dropped_total` increments. A wrong zone rule degrades observability rather than exhausting memory.
+
+`pairings.max_pairings` (default 5,000) is the earlier guard: if the desired pairing count exceeds it, the reconcile aborts and **keeps the previous assignment**. A configuration mistake cannot replace a working topology with an unworkable one.
 
 ---
 
-## 14. HTTP API
+# Part 9 — HTTP API
+
+Listens on `api.listen`, default `0.0.0.0:9101`.
 
 | Path | Method | Content |
 |---|---|---|
 | `/metrics` | GET | Prometheus exposition |
-| `/state` | GET | Current pairings and slots, read from RAM under a read lock |
-| `/inventory` | GET | Host records with resolved zone keys |
-| `/zones` | GET | Zone keys with member counts |
-| `/pairings` | GET | Pairing keys with slot fill status |
-| `/health` | GET | Per-host health state and hysteresis timers |
-| `/config` | GET | Effective config after defaults are applied |
-| `/reconcile` | POST | Force an immediate reconcile. Returns the delta |
-| `/refresh` | POST | Force a provider fetch. Optional `source` parameter |
+| `/state` | GET | Pairings, slots, persistence stats, last delta |
+| `/inventory` | GET | Host records with resolved zone keys, plus source status |
+| `/zones` | GET | Zone keys, members, unresolved hosts with the missing key |
+| `/pairings` | GET | Pairing keys with fill status, super host lists |
+| `/health` | GET | Per-host state and timers |
+| `/tasks` | GET | Running tasks with live window statistics |
+| `/config` | GET | Effective config after defaults, secrets redacted |
+| `/reconcile` | POST | Force a reconcile, returns the delta |
+| `/refresh` | POST | Force a provider poll, optional `?source=` |
 | `/livez` | GET | Process is running |
-| `/readyz` | GET | At least one provider has succeeded and one reconcile has completed |
+| `/readyz` | GET | A provider has produced hosts and a reconcile has completed |
 
-`/state` reads the RAM structs, not the JSON file, so it is current inside the debounce window.
+`/tasks` is the most useful debugging endpoint. It shows what this node is actually measuring right now and what the results look like, without going through Prometheus.
 
----
-
-## 15. Package layout
-
-```
-cmd/meshd/main.go
-cmd/meshping/main.go
-
-internal/config      config structs, defaults, validation, reload
-internal/inventory   HostRecord, merged inventory, snapshot
-internal/provider    Provider interface
-internal/provider/file
-internal/provider/http
-internal/provider/k8s
-internal/zone        zone rule, transforms, resolver
-internal/pairing     pairing set construction and filters
-internal/slot        slot classes, scan, rank
-internal/reconcile   pure Reconcile function, Delta
-internal/state       State structs, JSON load and save, debounce
-internal/health      health tracking, hysteresis, flap detection
-internal/probe       Prober interface, statistics, windows
-internal/probe/tcp
-internal/probe/udp
-internal/probe/icmp  client side of the meshping protocol
-internal/responder   UDP and TCP echo responders
-internal/runner      task lifecycle, delta application, goroutine control
-internal/metrics     registry and metric definitions
-internal/api         HTTP handlers
-pkg/pingproto        shared request and result types for meshping
-```
-
-`pkg/pingproto` is the only package that both binaries import.
+`/zones` is second. Its `unresolved` list names the specific attribute each excluded host is missing, which turns a silent topology problem into a named one.
 
 ---
 
-## 16. Concurrency
-
-| Component | Model |
-|---|---|
-| Providers | One goroutine each. Write to the inventory under a write lock |
-| Reconciler | One goroutine. Serialised by a trigger channel of capacity 1 |
-| Runner | One goroutine per directed task, each with its own ticker |
-| ICMP client | One writer goroutine and one reader goroutine on the `meshping` pipes. Requests are correlated by ID through a map under a mutex |
-| Responders | One goroutine per listener, plus one per accepted TCP connection |
-| Metrics | The Prometheus client library handles its own locking |
-
-Task start is spread over the cycle duration by a per-task offset derived from the task key, so all tasks do not fire in the same instant.
-
-Every long-lived goroutine takes a `context.Context` and exits on cancel. Shutdown order is: HTTP server, runner, `meshping`, reconciler, providers, final state write.
-
----
-
-## 17. Configuration file
-
-One YAML or JSON file. Reload on `SIGHUP` and on file change. A reload that fails validation is rejected and the previous config stays active.
+# Part 10 — Configuration reference
 
 ```yaml
-node_id: web-001.product.prod.sjc01.domain.com
+node_id: web-001.product.prod.sjc01.domain.com   # must match a host ID exactly
 
 providers:
   file:
@@ -707,19 +710,25 @@ providers:
     interval: 60s
     priority: 10
   http:
-    enabled: true
-    url: https://config.domain.com/mesh/inventory.json
+    enabled: false
+    url: https://config.example.com/mesh/inventory.json
     interval: 60s
     timeout: 10s
     cache_path: /var/lib/meshd/inventory.json
     cache_max_age: 24h
     auth_header_file: /etc/meshd/token
+    ca_file: ""
+    insecure_tls: false
+    backoff_min: 5s
+    backoff_max: 300s
     priority: 20
   k8s:
     enabled: false
     cluster_name: prod-usw2
     kubeconfig: ""
     resync: 300s
+    interval: 60s
+    debounce: 2s
     label_selector: ""
     address_order: [InternalIP, Hostname]
     taint_deny:
@@ -727,27 +736,29 @@ providers:
       - node.kubernetes.io/not-ready
       - node.kubernetes.io/unschedulable
     annotation_allow: []
+    priority: 30
 
 zone:
-  keys: [metro, dc_instance]
+  keys: [metro, dc_instance]     # or [{key: k8s.zone, transform: lower}]
   separator: "/"
-  missing: exclude
+  missing: exclude               # exclude | empty | literal:<value>
 
 pairings:
   intra_zone: false
-  include: []
+  include: []                    # glob patterns against the pairing key
   exclude: []
   max_pairings: 5000
 
 slots:
   count: 4
   anchor_ratio: 0.5
-  anchor_rounding: up
+  anchor_rounding: up            # up | down
   super_hosts: 0
   super_selector: {}
   super_max_targets: 50
   allow_reuse: true
-  rebalance_on_add: false
+  rebalance_on_add: false        # accepted, not yet acted on
+  reclaim: false                 # accepted, not yet acted on
 
 health:
   unhealthy_after: 3
@@ -760,14 +771,33 @@ health:
   flap_window: 10m
   flap_cooldown: 15m
   pairing_removal_hold: 300s
-  reclaim: false
 
 probes:
   cycle: 15s
   window: 60s
-  icmp: { enabled: true, interval: 1s, count: 10, payload_bytes: 56, timeout: 1s, ttl: 64, df: false }
-  udp:  { enabled: true, interval: 1s, count: 10, payload_bytes: 64, port: 8472, timeout: 1s }
-  tcp:  { enabled: true, interval: 5s, count: 5,  payload_bytes: 64, port: 9100, timeout: 2s, mode: connect }
+  icmp:
+    enabled: true
+    interval: 1s
+    count: 10
+    payload_bytes: 56
+    timeout: 1s
+    ttl: 64
+    df: false                    # accepted, not applied
+  udp:
+    enabled: true
+    interval: 1s
+    count: 10
+    payload_bytes: 64
+    port: 8472
+    timeout: 1s
+  tcp:
+    enabled: true
+    interval: 5s
+    count: 5
+    payload_bytes: 64
+    port: 9100
+    timeout: 2s
+    mode: connect                # connect | echo
 
 responder:
   enabled: true
@@ -778,6 +808,7 @@ meshping:
   path: /usr/local/bin/meshping
   restart_backoff_min: 1s
   restart_backoff_max: 30s
+  hello_timeout: 5s
 
 reconcile:
   interval: 30s
@@ -796,50 +827,219 @@ metrics:
   percentiles: [0.5, 0.9, 0.99]
 
 log:
-  level: info
-  format: json
+  level: info                    # debug | info | warn | error
+  format: json                   # json | text
 ```
 
+## 10.1 Zone transforms
+
+Each key can carry a transform:
+
+| Transform | Effect |
+|---|---|
+| `lower`, `upper`, `trim` | Case and whitespace |
+| `prefix:<n>` | Keep the first n characters |
+| `regex:<pattern>:<replacement>` | Full regex rewrite |
+
+Example: `{key: k8s.zone, transform: "regex:^(.*)-[a-z]$:$1"}` turns `us-west-2a` into `us-west-2`, collapsing availability zones into regions without a second attribute.
+
+## 10.2 Reload
+
+`SIGHUP` or file modification triggers a reload. A configuration that fails validation is **rejected** and the previous one stays active. Validation reports every problem at once, not just the first.
+
+A reload that changes `zone`, `pairings`, or `slots` logs a warning, because it will rebuild the entire slot table and break every time series. Other reloads apply without disruption.
+
+Use `meshd -check -config <path>` to validate without starting.
+
 ---
 
-## 18. Change cost table
+# Part 11 — Build
 
-| Event | Slot sides changed | Time series affected |
+**File: `build.sh`**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+go mod tidy
+go vet ./...
+
+go build -o ./meshd ./cmd/meshd
+go build -o ./meshping ./cmd/meshping
+
+if command -v setcap >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+    setcap cap_net_raw+ep ./meshping
+fi
+
+ls -l ./meshd ./meshping
+```
+
+`set -euo pipefail` means a `go vet` failure aborts the script before `go build` runs. If you see stale behaviour from a binary after editing source, check the script's exit code — a silent vet failure leaves the old binary in place.
+
+## 11.1 ICMP permission
+
+Three options, in order of preference:
+
+**Unprivileged datagram socket.** Check `sysctl net.ipv4.ping_group_range`. If it includes your group ID, nothing further is needed.
+
+**Capability.** `sudo setcap cap_net_raw+ep ./meshping`. Grants exactly one capability to one small program.
+
+**Neither.** ICMP is disabled, `mesh_icmp_available` reads 0, TCP and UDP continue. This is a supported mode.
+
+Setuid is **not** supported. The privilege-drop path returns an error rather than attempting a partial drop.
+
+## 11.2 Dependencies
+
+| Module | Purpose |
+|---|---|
+| `github.com/prometheus/client_golang` | Metric registry and exposition |
+| `golang.org/x/net` | ICMP packet construction and parsing |
+| `gopkg.in/yaml.v3` | Configuration parsing |
+| `k8s.io/client-go`, `k8s.io/api`, `k8s.io/apimachinery` | Node informer |
+
+---
+
+# Part 12 — Operational behaviour
+
+## 12.1 Startup sequence
+
+1. Parse and validate configuration. Failure exits with code 2.
+2. Build the metric registry.
+3. Compile the zone rule, pairing filter, and slot scanner. Failure exits with code 3.
+4. **Load the state file.** Assignments survive the restart.
+5. Start the persistence writer.
+6. Start providers.
+7. Start `meshping` if ICMP is enabled.
+8. Start the responder.
+9. Start the runner.
+10. Start the reconcile loop, which runs immediately.
+11. Start the config watcher.
+12. Start the HTTP server.
+
+The state loading in step 4 is why a restart produces no time-series break: the same hosts hold the same slots, the delta is empty, and the runner starts exactly the tasks that were running before.
+
+## 12.2 Shutdown
+
+`SIGINT` or `SIGTERM`. Reverse order: HTTP server, runner (each task's context cancelled), `meshping`, responder, reconcile loop, providers, **final state write**. Bounded by a 15-second grace period.
+
+## 12.3 Reconcile triggers
+
+| Trigger | Cause |
+|---|---|
+| `start` | Process start |
+| `provider` | Inventory generation advanced |
+| `config` | Configuration reloaded |
+| `health` | Host eligibility changed |
+| `timer` | A health hold expired |
+| `tick` | Periodic safety net |
+| `api` | POST to `/reconcile` |
+
+Triggers are coalesced through a capacity-1 channel. Ten triggers during a run produce exactly one further run, not ten.
+
+## 12.4 Change cost
+
+| Event | Slot sides changed | Series affected |
 |---|---|---|
-| One host becomes unhealthy | One side per slot that held it | Those slots only |
-| One host added to a zone | Zero, when `rebalance_on_add` is false | None, unless a slot was unfilled |
+| One host unhealthy | One per slot that held it | Those slots only |
+| One host added | Zero (default) | None |
 | Node pool scales up | Zero | None |
-| Node pool scales down | One side per affected slot | Those slots only |
+| Node pool scales down | One per affected slot | Those slots only |
 | `slots.count` raised | New slots only | New series added, existing untouched |
-| Zone rule changed | All | All. This is a topology change, not a repair |
+| Zone rule changed | All | All — this is a topology change, not a repair |
 | New zone appears | New pairings only | New series added |
-| HTTP fetch fails | Zero | None. The cached set stays active |
-| `meshd` restart with state file present | Zero | None |
-| `meshd` restart with state file lost | All | All |
+| HTTP fetch fails | Zero | None; the cache stays active |
+| Restart with state file | Zero | None |
+| Restart without state file | All | All |
+
+Row 2 is a policy choice. `rebalance_on_add: false` keeps existing valid assignments even when a better-ranked candidate appears. Setting it true would improve coverage at the cost of breaking those series. The default favours continuity.
+
+## 12.5 Failure modes
+
+| Symptom | Cause | Where to look |
+|---|---|---|
+| `mesh_tasks_running` is 0 | `node_id` does not match a host ID | `/inventory`, `/tasks` |
+| Hosts in `unresolved` | Zone rule needs an attribute the host lacks | `/zones`, field `missing_key` |
+| UDP loss ratio 1.0 | Responder not listening, or wrong port | `mesh_responder_total`, `/config` |
+| `mesh_icmp_available` is 0 | `meshping` has no permission | Startup log, `getcap` |
+| `mesh_slots_unfilled` above 0 | Zone has too few eligible hosts for the slot count | `/pairings`, `/health` |
+| `mesh_reconcile_errors_total` rising | Pairing count exceeds `max_pairings` | Log message names the counts |
+| `mesh_provider_cache_age_seconds` rising | HTTP source unreachable, running on cache | `mesh_provider_fetch_total{result="failure"}` |
+| `mesh_series_dropped_total` rising | Cardinality limit reached | `mesh_series_count`, review zone rule |
+| High `mesh_slot_changes_total{reason="host_unhealthy"}` | Assignment churn | `/health` for flapping hosts |
 
 ---
 
-## 19. Assumptions taken
+# Part 13 — Deployment
 
-These items were open in the previous discussion. The values below are the assumptions in this specification. Correct any that are wrong.
+## 13.1 One process per node
 
-1. **Provider merging.** All providers merge into one inventory with one zone rule. Priority resolves ID collisions. A static host and a Kubernetes node can therefore appear in the same zone pairing.
-2. **Super host selection.** By selector rule first, then by canonical order. Sticky until ineligible.
-3. **Anchor rounding.** Rounds up by default. At `count: 3` and `anchor_ratio: 0.5` the result is 2 anchor slots and 1 diverse slot.
-4. **Direction.** Both nodes probe the same slot from their own side, independently. No coordination.
-5. **State sharing.** Nodes do not share state files. Each node holds its own copy.
+Every node runs its own `meshd` with its own `node_id`. Each computes the full topology, then filters down to the tasks where it is the source.
+
+Nodes do **not** share state files. Each holds its own copy. Divergence after a lost state file is possible and is visible in the metrics, because the slot host labels differ between nodes.
+
+## 13.2 Sizing
+
+Per-node task count:
+
+```
+tasks ≈ (slots where this node is an endpoint) × (enabled probe types)
+```
+
+For a node in a zone of 20 machines, with 4 slots per pairing and 10 zones, this node holds roughly `4 × 9 / 20 ≈ 2` slot sides, giving about 6 tasks across three probe types. Task count per node stays low regardless of fleet size, because slots per pairing is fixed and hosts share the load.
+
+## 13.3 Firewall
+
+| Direction | Port | Protocol |
+|---|---|---|
+| Inbound | 8472 | UDP, from mesh nodes |
+| Inbound | 9100 | TCP, from mesh nodes |
+| Inbound | 9101 | TCP, from Prometheus |
+| Inbound | — | ICMP echo request, from mesh nodes |
+| Outbound | Same set, to mesh nodes | |
+
+If ICMP is blocked, disable it in configuration rather than leaving it enabled and failing.
+
+## 13.4 Prometheus scrape
+
+```yaml
+scrape_configs:
+  - job_name: mesh
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['web-001.product.prod.sjc01.domain.com:9101']
+```
+
+Scrape interval should be at or below `probes.window`, so no window's worth of data is missed.
 
 ---
 
-## 20. Approval
+# Part 14 — Known limitations
 
-On approval of this specification, the implementation order is:
+| Item | Status |
+|---|---|
+| `rebalance_on_add` | Accepted, validated, fingerprinted; the reconcile does not act on it. Defaults false |
+| `reclaim` | Same. Defaults false |
+| `probes.icmp.df` | Accepted; not applied. Setting the DF bit is not portable through `golang.org/x/net/icmp`. Path MTU testing would need platform-specific socket options |
+| Setuid mode for `meshping` | Not supported. Use `setcap` or the unprivileged datagram socket |
+| One-way delay | The responder stamps its receive time into the reply header, but `meshd` does not yet compute one-way delay from it. The wire format supports it |
+| Cross-node state sharing | Not implemented and not required. Determinism substitutes for it, but a node with a lost state file will re-derive an assignment that may differ from its peers' view |
+| IPv6 | `meshping` opens an IPv6 socket when available and the protocol carries an `ipv6` flag, but address family selection is driven by resolution rather than by configuration |
 
-1. `pkg/pingproto` and `cmd/meshping`.
-2. `internal/config`, `internal/inventory`, `internal/zone`.
-3. `internal/provider/file`, then `http`, then `k8s`.
-4. `internal/pairing`, `internal/slot`, `internal/reconcile`, with table-driven tests against fixtures.
-5. `internal/state`, `internal/health`.
-6. `internal/probe`, `internal/responder`, `internal/runner`.
-7. `internal/metrics`, `internal/api`, `cmd/meshd`.
+---
 
+# Part 15 — Reading the code
+
+Suggested order for a new reader:
+
+1. **`internal/inventory/inventory.go`** — `HostRecord`. Note the untyped `Attributes` map. Everything follows from that decision.
+2. **`internal/zone/zone.go`** — how a rule turns attributes into a zone key.
+3. **`internal/pairing/pairing.go`** — how zone keys become pairings. Short file.
+4. **`internal/slot/slot.go`** — classes, ranks, and `StartOffset`. The scan is the heart of the determinism.
+5. **`internal/reconcile/reconcile.go`** — the pure function. Read `validateSides` and `fillSides` closely; the independent-side rule lives there.
+6. **`internal/health/health.go`** — the state machine. Read `Status.Eligible` and note which states return true.
+7. **`internal/runner/runner.go`** — `desired` and `Apply`. How a delta becomes running goroutines.
+8. **`internal/probe/probe.go`** — the `Window` and its statistics.
+9. **`cmd/meshd/main.go`** — how it is all wired together.
+
+`cmd/meshping/main.go` is independent of everything else and can be read alone.

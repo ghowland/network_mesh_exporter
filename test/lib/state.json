@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "zone_rule": "818f957411708fe6",
+  "slots_config": "n=2 ratio=0.5000 round=up super=0 max=50 reuse=true",
+  "updated_at": "2026-08-14T09:24:07.932537665+07:00",
+  "pairings": {
+    "sjc/01|sjc/02": {
+      "key": "sjc/01|sjc/02",
+      "zone_a": "sjc/01",
+      "zone_b": "sjc/02",
+      "intra": false,
+      "slots": [
+        {
+          "index": 0,
+          "class": "anchor",
+          "host_a": "web-001.product.prod.sjc01.local",
+          "host_b": "web-001.product.prod.sjc02.local",
+          "rank_a": 1,
+          "rank_b": 1,
+          "assigned_a": "2026-08-14T09:24:02.699759349+07:00",
+          "assigned_b": "2026-08-14T09:24:02.699759349+07:00"
+        },
+        {
+          "index": 1,
+          "class": "diverse",
+          "host_a": "web-002.product.prod.sjc01.local",
+          "host_b": "web-002.product.prod.sjc02.local",
+          "rank_a": 1,
+          "rank_b": 1,
+          "assigned_a": "2026-08-14T09:24:02.699759349+07:00",
+          "assigned_b": "2026-08-14T09:24:02.699759349+07:00"
+        }
+      ],
+      "remove_at": "0001-01-01T00:00:00Z"
+    }
+  },
+  "super_hosts": {}
+}
