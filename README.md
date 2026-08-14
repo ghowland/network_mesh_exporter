@@ -13,6 +13,44 @@ Two binaries:
 
 ---
 
+## Diagrams
+
+Three schematics cover the whole system: how a static server list becomes a
+slot table, how the same happens from Kubernetes node metadata, and how zone
+selection and the three probe protocols relate to each other.
+
+### Static server list
+
+![Static server list flow](docs/mesh_static_servers.png)
+
+A JSON document is parsed into host records. The DNS name supplies the role,
+service, environment, and site; the site table supplies the country and data
+centre label that the DNS name has no reason to carry. The zone rule reduces
+those attributes to a zone key, zone keys pair up, and the slot table fills.
+
+### Kubernetes provider
+
+![Kubernetes provider flow](docs/mesh_k8s_servers.png)
+
+The same pipeline, fed from node labels instead of DNS names. The provider
+imposes no schema — every label becomes an attribute, and the zone rule decides
+which ones matter. Because the host record type is identical, everything below
+the provider is the same code. `meshd` runs as a DaemonSet, and each node
+measures only the slots where it is the source.
+
+### Zone selection and protocols
+
+![Zone selection and protocol paths](docs/mesh_zone_config.png)
+
+The upper half shows one host list resolved four different ways by four
+different zone rules, from full mesh down to country level. Changing the mesh
+level is a configuration change, not a code change. The lower half shows what
+each slot actually measures: ICMP through the privileged helper, UDP against
+the echo responder, and TCP against a plain listener, all folded into one
+rolling window and exported under one label set.
+
+---
+
 ## Why
 
 The naive approach is a full mesh: every machine probes every other machine.
