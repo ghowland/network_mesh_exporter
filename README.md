@@ -1,4 +1,4 @@
-# Mesh Network Test System
+# Network Mesh Exporter
 
 A distributed network measurement system. It probes RTT, jitter, packet loss,
 reorder, and TCP handshake time between groups of machines, and publishes the
